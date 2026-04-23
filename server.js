@@ -8,39 +8,69 @@ app.use(express.text({ type: '*/*' }));
 
 let cookieJar = '';
 
+function mergeCookies(oldCookie, setCookies) {
+  const jar = {};
+  if (oldCookie) {
+    oldCookie.split(';').forEach(c => {
+      const [k, ...v] = c.trim().split('=');
+      if (k) jar[k] = v.join('=');
+    });
+  }
+
+  for (const sc of setCookies || []) {
+    const first = sc.split(';')[0];
+    const [k, ...v] = first.split('=');
+    if (k) jar[k] = v.join('=');
+  }
+
+  return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
 app.all('/proxy', async (req, res) => {
-  const target = req.headers['x-target-url'];
+  let target = req.headers['x-target-url'];
   if (!target) return res.status(400).send('Missing x-target-url');
 
-  const headers = {};
-  if (cookieJar) headers['Cookie'] = cookieJar;
-  if (req.method === 'POST') headers['Content-Type'] = 'application/x-www-form-urlencoded';
+  let method = req.method;
+  let body = req.method === 'GET' || req.method === 'HEAD' ? undefined : req.body;
 
   try {
-    const r = await fetch(target, {
-      method: req.method,
-      headers,
-      body: req.method === 'GET' ? undefined : req.body,
-      redirect: 'follow'
-    });
+    let response;
 
-    const setCookie = r.headers.get('set-cookie');
-    if (setCookie) {
-      const match = setCookie.match(/MoodleSession[^=]*=[^;]+/);
-      if (match) cookieJar = match[0];
+    for (let i = 0; i < 5; i++) {
+      const headers = {};
+      if (cookieJar) headers['Cookie'] = cookieJar;
+      if (body) headers['Content-Type'] = 'application/x-www-form-urlencoded';
+
+      response = await fetch(target, {
+        method,
+        headers,
+        body,
+        redirect: 'manual'
+      });
+
+      const setCookies = response.headers.raw()['set-cookie'] || [];
+      cookieJar = mergeCookies(cookieJar, setCookies);
+
+      if (![301, 302, 303, 307, 308].includes(response.status)) break;
+
+      const loc = response.headers.get('location');
+      if (!loc) break;
+
+      target = new URL(loc, target).href;
+      method = 'GET';
+      body = undefined;
     }
 
-    const text = await r.text();
+    const text = await response.text();
 
     res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.set('Access-Control-Allow-Headers', 'Content-Type, x-target-url, x-campus-cookie');
     res.set('Access-Control-Expose-Headers', 'x-set-cookie');
     res.set('x-set-cookie', cookieJar || '');
 
-    res.send(text);
+    res.status(response.status).send(text);
   } catch (e) {
-    res.status(500).send(e.message);
+    res.status(500).send('Proxy error: ' + e.message);
   }
 });
 
