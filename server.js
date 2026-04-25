@@ -1,77 +1,108 @@
-import express from 'express';
-import fetch from 'node-fetch';
-import cors from 'cors';
+const express = require('express');
+const https   = require('https');
+const http    = require('http');
+const app     = express();
 
-const app = express();
-app.use(cors());
-app.use(express.text({ type: '*/*' }));
+// Parsear body como texto plano
+app.use(express.text({ type: '*/*', limit: '5mb' }));
 
-let cookieJar = '';
+// CORS — permitir cualquier origen
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin',  '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-target-url, x-campus-cookie');
+  res.setHeader('Access-Control-Expose-Headers','x-set-cookie');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
-function mergeCookies(oldCookie, setCookies) {
-  const jar = {};
-  if (oldCookie) {
-    oldCookie.split(';').forEach(c => {
-      const [k, ...v] = c.trim().split('=');
-      if (k) jar[k] = v.join('=');
-    });
-  }
+// Ruta raíz — verificar que está activo
+app.get('/', (req, res) => {
+  res.send('Campus Bot Proxy activo. Falta x-target-url');
+});
 
-  for (const sc of setCookies || []) {
-    const first = sc.split(';')[0];
-    const [k, ...v] = first.split('=');
-    if (k) jar[k] = v.join('=');
-  }
-
-  return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
-}
-
+// Proxy principal
 app.all('/proxy', async (req, res) => {
-  let target = req.headers['x-target-url'];
-  if (!target) return res.status(400).send('Missing x-target-url');
+  const targetUrl = req.headers['x-target-url'];
 
-  let method = req.method;
-  let body = req.method === 'GET' || req.method === 'HEAD' ? undefined : req.body;
+  if (!targetUrl) {
+    return res.status(400).send('Falta x-target-url');
+  }
 
+  if (!targetUrl.includes('campus.unma.net.ar')) {
+    return res.status(403).send('URL no permitida');
+  }
+
+  // Headers para el campus
+  const reqHeaders = {
+    'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'es-AR,es;q=0.9',
+    'Connection':      'keep-alive',
+  };
+
+  if (req.headers['content-type']) {
+    reqHeaders['Content-Type'] = req.headers['content-type'];
+  }
+
+  // Pasar cookie de sesión
+  const campusCookie = req.headers['x-campus-cookie'];
+  if (campusCookie) {
+    reqHeaders['Cookie'] = campusCookie;
+  }
+
+  // Hacer el request al campus
   try {
-    let response;
+    const url    = new URL(targetUrl);
+    const isHttps = url.protocol === 'https:';
+    const client = isHttps ? https : http;
+    const port   = url.port || (isHttps ? 443 : 80);
 
-    for (let i = 0; i < 5; i++) {
-      const headers = {};
-      if (cookieJar) headers['Cookie'] = cookieJar;
-      if (body) headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    const options = {
+      hostname: url.hostname,
+      port:     port,
+      path:     url.pathname + url.search,
+      method:   req.method,
+      headers:  reqHeaders,
+    };
 
-      response = await fetch(target, {
-        method,
-        headers,
-        body,
-        redirect: 'manual'
-      });
+    const proxyReq = client.request(options, (proxyRes) => {
+      // Pasar Set-Cookie como header especial
+      const setCookie = proxyRes.headers['set-cookie'];
+      if (setCookie) {
+        res.setHeader('x-set-cookie', Array.isArray(setCookie) ? setCookie.join('; ') : setCookie);
+      }
 
-      const setCookies = response.headers.raw()['set-cookie'] || [];
-      cookieJar = mergeCookies(cookieJar, setCookies);
+      // Content-Type
+      const ct = proxyRes.headers['content-type'] || 'text/html; charset=utf-8';
+      res.setHeader('Content-Type', ct);
+      res.status(proxyRes.statusCode);
 
-      if (![301, 302, 303, 307, 308].includes(response.status)) break;
+      // Stream de respuesta
+      proxyRes.pipe(res);
+    });
 
-      const loc = response.headers.get('location');
-      if (!loc) break;
+    proxyReq.on('error', (e) => {
+      console.error('Proxy error:', e.message);
+      if (!res.headersSent) {
+        res.status(502).send('Error conectando al campus: ' + e.message);
+      }
+    });
 
-      target = new URL(loc, target).href;
-      method = 'GET';
-      body = undefined;
+    // Enviar body si es POST
+    if (req.method === 'POST' && req.body) {
+      proxyReq.write(req.body);
     }
 
-    const text = await response.text();
+    proxyReq.end();
 
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, x-target-url, x-campus-cookie');
-    res.set('Access-Control-Expose-Headers', 'x-set-cookie');
-    res.set('x-set-cookie', cookieJar || '');
-
-    res.status(response.status).send(text);
   } catch (e) {
-    res.status(500).send('Proxy error: ' + e.message);
+    console.error('Error:', e.message);
+    res.status(500).send('Error interno: ' + e.message);
   }
 });
 
-app.listen(3000, () => console.log('Proxy running on port 3000'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log('Campus Bot Proxy corriendo en puerto', PORT);
+});
